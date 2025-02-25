@@ -1,24 +1,20 @@
-const std = @import("std");
+const __bss = @extern([*]u8, .{ .name = "__bss" });
+const __bss_end = @extern([*]u8, .{ .name = "__bss_end" });
+const __stack_top = @extern([*]u8, .{ .name = "__stack_top" });
 
-pub fn main() !void {
-    // Prints to stderr (it's a shortcut based on `std.io.getStdErr()`)
-    std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
-
-    // stdout is for the actual output of your application, for example if you
-    // are implementing gzip, then only the compressed bytes should be sent to
-    // stdout, not any debugging messages.
-    const stdout_file = std.io.getStdOut().writer();
-    var bw = std.io.bufferedWriter(stdout_file);
-    const stdout = bw.writer();
-
-    try stdout.print("Run `zig build test` to run the tests.\n", .{});
-
-    try bw.flush(); // don't forget to flush!
+export fn boot() linksection(".text.boot") callconv(.Naked) noreturn {
+    asm volatile (
+        \\mv sp, %[stack_top]
+        \\j kernel_main
+        :
+        : [stack_top] "r" (__stack_top),
+    );
 }
 
-test "simple test" {
-    var list = std.ArrayList(i32).init(std.testing.allocator);
-    defer list.deinit(); // try commenting this out and see if zig detects the memory leak!
-    try list.append(42);
-    try std.testing.expectEqual(@as(i32, 42), list.pop());
+export fn kernel_main() void {
+    var slice: []u8 = undefined;
+    slice.ptr = __bss;
+    slice.len = @intFromPtr(__bss_end) - @intFromPtr(__bss);
+    @memset(slice, 0);
+    while (true) {}
 }
