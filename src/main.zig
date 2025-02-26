@@ -21,6 +21,9 @@ export fn kernel_main() void {
 
     log("Hello: {d}", .{69});
 
+    var a: u8 = 255;
+    a += 1;
+
     wfi();
 }
 
@@ -84,4 +87,14 @@ fn log(
 ) void {
     const writer: ConsoleWriter = .{ .context = {} };
     writer.print(format ++ "\n", args) catch unreachable;
+}
+
+pub fn panic(message: []const u8, stack_trace: ?*std.builtin.StackTrace, ra: ?usize) noreturn {
+    _ = stack_trace;
+    _ = ra;
+
+    log("\n!KERNEL PANIC!\n{s}\n", .{message});
+    // log("{p} {p}", .{ __debug_info_start, __debug_info_end });
+    wfi();
+    while (true) {}
 }
