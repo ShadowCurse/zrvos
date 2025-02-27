@@ -2,6 +2,8 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const PAGE_SIZE = 4096;
+const paddr = usize;
+const vaddr = usize;
 
 const __bss = @extern([*]u8, .{ .name = "__bss" });
 const __bss_end = @extern([*]u8, .{ .name = "__bss_end" });
@@ -11,7 +13,7 @@ const __ram_end = @extern([*]align(PAGE_SIZE) u8, .{ .name = "__ram_end" });
 
 var kernel_page_allocator: KernelPageAllocator = undefined;
 const KernelPageAllocator = struct {
-    cursor: usize,
+    cursor: paddr,
 
     const Self = @This();
 
