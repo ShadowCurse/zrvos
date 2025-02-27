@@ -1,8 +1,59 @@
 const std = @import("std");
+const Allocator = std.mem.Allocator;
+
+const PAGE_SIZE = 4096;
 
 const __bss = @extern([*]u8, .{ .name = "__bss" });
 const __bss_end = @extern([*]u8, .{ .name = "__bss_end" });
 const __stack_top = @extern([*]u8, .{ .name = "__stack_top" });
+const __ram_start = @extern([*]align(PAGE_SIZE) u8, .{ .name = "__ram_start" });
+const __ram_end = @extern([*]align(PAGE_SIZE) u8, .{ .name = "__ram_end" });
+
+var kernel_page_allocator: KernelPageAllocator = undefined;
+const KernelPageAllocator = struct {
+    cursor: usize,
+
+    const Self = @This();
+
+    fn init() Self {
+        return .{
+            .cursor = @intFromPtr(__ram_start),
+        };
+    }
+
+    fn alloc(self: *Self, n: u32) []align(PAGE_SIZE) u8 {
+        const bytes = n * PAGE_SIZE;
+        if (@intFromPtr(__ram_end) < self.cursor + n)
+            unreachable;
+        var slice: []align(PAGE_SIZE) u8 = undefined;
+        slice.ptr = @ptrFromInt(self.cursor);
+        slice.len = bytes;
+        return slice;
+    }
+};
+
+var kernel_bump_allocator_impl: std.heap.FixedBufferAllocator = undefined;
+const kernel_bump_allocator = kernel_bump_allocator_impl.allocator();
+
+fn kernel_ram_slice() []align(PAGE_SIZE) u8 {
+    var s: []align(PAGE_SIZE) u8 = undefined;
+    s.ptr = __ram_start;
+    s.len = @intFromPtr(__ram_end) - @intFromPtr(__ram_start);
+    return s;
+}
+
+fn init_kernel_allocators() void {
+    kernel_page_allocator = KernelPageAllocator.init();
+    const bump_allocator_memory = kernel_page_allocator.alloc(1);
+    kernel_bump_allocator_impl = std.heap.FixedBufferAllocator.init(bump_allocator_memory);
+}
+
+fn zero_bss() void {
+    var slice: []u8 = undefined;
+    slice.ptr = __bss;
+    slice.len = @intFromPtr(__bss_end) - @intFromPtr(__bss);
+    @memset(slice, 0);
+}
 
 export fn boot() linksection(".text.boot") callconv(.Naked) noreturn {
     asm volatile (
@@ -14,14 +65,17 @@ export fn boot() linksection(".text.boot") callconv(.Naked) noreturn {
 }
 
 export fn kernel_main() void {
-    var slice: []u8 = undefined;
-    slice.ptr = __bss;
-    slice.len = @intFromPtr(__bss_end) - @intFromPtr(__bss);
-    @memset(slice, 0);
+    zero_bss();
+    init_kernel_allocators();
 
     write_csr("stvec", @intFromPtr(&kernel_entry));
 
     log("Hello: {d}", .{69});
+
+    var a = kernel_bump_allocator.alloc(u8, 2) catch unreachable;
+    a[0] = 1;
+    a[1] = 2;
+    log("Some allocated numbers: {any}", .{a});
 
     unimpl();
 }
