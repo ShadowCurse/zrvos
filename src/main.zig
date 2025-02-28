@@ -5,6 +5,56 @@ const PAGE_SIZE = 4096;
 const paddr = usize;
 const vaddr = usize;
 
+export fn boot() linksection(".text.boot") callconv(.Naked) noreturn {
+    asm volatile (
+        \\mv sp, %[stack_top]
+        \\j kernel_main
+        :
+        : [stack_top] "r" (__stack_top),
+    );
+}
+
+export fn kernel_main() void {
+    zero_bss();
+    init_kernel_allocators();
+    init_processes();
+
+    write_csr("stvec", @intFromPtr(&kernel_entry));
+
+    log("Hello: {d}", .{69});
+
+    var a = kernel_bump_allocator.alloc(u8, 2) catch unreachable;
+    a[0] = 1;
+    a[1] = 2;
+    log("Some allocated numbers: {any}", .{a});
+
+    proc_1 = create_process(@intFromPtr(&proc_1_entry));
+    proc_2 = create_process(@intFromPtr(&proc_2_entry));
+    proc_1_entry();
+
+    unimpl();
+}
+
+var proc_1: *Process = undefined;
+var proc_2: *Process = undefined;
+
+fn proc_1_entry() void {
+    log("starting proc 1", .{});
+    while (true) {
+        sbi_put_char('A');
+        context_switch(&proc_1.sp, &proc_2.sp);
+        delay();
+    }
+}
+fn proc_2_entry() void {
+    log("starting proc 2", .{});
+    while (true) {
+        sbi_put_char('B');
+        context_switch(&proc_2.sp, &proc_1.sp);
+        delay();
+    }
+}
+
 const __bss = @extern([*]u8, .{ .name = "__bss" });
 const __bss_end = @extern([*]u8, .{ .name = "__bss_end" });
 const __stack_top = @extern([*]u8, .{ .name = "__stack_top" });
@@ -57,29 +107,10 @@ fn zero_bss() void {
     @memset(slice, 0);
 }
 
-export fn boot() linksection(".text.boot") callconv(.Naked) noreturn {
-    asm volatile (
-        \\mv sp, %[stack_top]
-        \\j kernel_main
-        :
-        : [stack_top] "r" (__stack_top),
-    );
-}
-
-export fn kernel_main() void {
-    zero_bss();
-    init_kernel_allocators();
-
-    write_csr("stvec", @intFromPtr(&kernel_entry));
-
-    log("Hello: {d}", .{69});
-
-    var a = kernel_bump_allocator.alloc(u8, 2) catch unreachable;
-    a[0] = 1;
-    a[1] = 2;
-    log("Some allocated numbers: {any}", .{a});
-
-    unimpl();
+fn delay() void {
+    for (0..30000000) |_| {
+        asm volatile ("nop");
+    }
 }
 
 fn wfi() void {
@@ -88,6 +119,98 @@ fn wfi() void {
 
 fn unimpl() void {
     asm volatile ("unimp");
+}
+
+fn save_regs_asm(comptime regs: []const []const u8) []const u8 {
+    comptime var s: []const u8 = std.fmt.comptimePrint("addi sp, sp, -4 * {d}\n", .{regs.len});
+    inline for (regs, 0..) |reg, i| {
+        s = s ++ std.fmt.comptimePrint("sw {s}, {d} * 4(sp)\n", .{ reg, i });
+    }
+    return s;
+}
+
+fn restore_regs_asm(comptime regs: []const []const u8) []const u8 {
+    comptime var s: []const u8 = &.{};
+    inline for (regs, 0..) |reg, i| {
+        s = s ++ std.fmt.comptimePrint("lw {s}, {d} * 4(sp)\n", .{ reg, i });
+    }
+    s = s ++ std.fmt.comptimePrint("addi sp, sp, 4 * {d}\n", .{regs.len});
+    return s;
+}
+
+const MAX_PROCESSES = 32;
+var processes: [MAX_PROCESSES]Process = undefined;
+fn init_processes() void {
+    for (&processes) |*proc| {
+        const stack = kernel_page_allocator.alloc(1);
+        @memset(stack, 0);
+        proc.* = .{
+            .stack = stack,
+        };
+    }
+}
+const ProcessState = enum {
+    unused,
+    runnable,
+};
+const Process = struct {
+    pid: u32 = 0,
+    state: ProcessState = .unused,
+    sp: vaddr = 0,
+    stack: []align(PAGE_SIZE) u8,
+
+    const Self = @This();
+
+    fn init(self: *Self, pid: u32, pc: vaddr) void {
+        self.pid = pid;
+        self.state = .runnable;
+
+        var stack_u32: []u32 = undefined;
+        stack_u32.ptr = @ptrCast(self.stack.ptr);
+        stack_u32.len = self.stack.len / 4;
+        stack_u32[stack_u32.len - 1] = 0; // s11
+        stack_u32[stack_u32.len - 2] = 0; // s10
+        stack_u32[stack_u32.len - 3] = 0; // s9
+        stack_u32[stack_u32.len - 4] = 0; // s8
+        stack_u32[stack_u32.len - 5] = 0; // s7
+        stack_u32[stack_u32.len - 6] = 0; // s6
+        stack_u32[stack_u32.len - 7] = 0; // s5
+        stack_u32[stack_u32.len - 8] = 0; // s4
+        stack_u32[stack_u32.len - 9] = 0; // s3
+        stack_u32[stack_u32.len - 10] = 0; // s2
+        stack_u32[stack_u32.len - 11] = 0; // s1
+        stack_u32[stack_u32.len - 12] = 0; // s0
+        stack_u32[stack_u32.len - 13] = pc; // ra
+
+        self.sp = @intFromPtr(&stack_u32[stack_u32.len - 13]);
+    }
+};
+
+fn create_process(pc: vaddr) *Process {
+    for (&processes, 0..) |*proc, i| {
+        if (proc.state == .unused) {
+            proc.init(i + 1, pc);
+            return proc;
+        }
+    }
+
+    panic("No available processes", null, null);
+}
+
+// This function does generate prolog and epilog even though it does not need it.
+// This is most likely due to generating assembly string at compile time. Maybe
+// new version of compiler will fix this.
+noinline fn context_switch(noalias prev_sp: *vaddr, noalias next_sp: *vaddr) void {
+    const regs = &.{ "ra", "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11" };
+    asm volatile (save_regs_asm(regs) ++
+            "sw sp, (%[arg1])\n" ++
+            "lw sp, (%[arg2])\n" ++
+            restore_regs_asm(regs) ++
+            "ret\n"
+        :
+        : [arg1] "r" (prev_sp),
+          [arg2] "r" (next_sp),
+    );
 }
 
 const trap_frame = packed struct {
