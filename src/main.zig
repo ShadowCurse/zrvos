@@ -19,7 +19,7 @@ export fn kernel_main() void {
     init_kernel_allocators();
     init_processes();
 
-    write_csr("stvec", @intFromPtr(&kernel_entry));
+    write_csr("stvec", @intFromPtr(&kernel_exception_entry));
 
     log("Hello: {d}", .{69});
 
@@ -170,6 +170,10 @@ const Process = struct {
     sp: vaddr = 0,
     stack: []align(PAGE_SIZE) u8,
 
+    // During exception handling the first 32 * 4 bytes will be used
+    // to store registers. Actual process stack starts from 33 * 4 byte.
+    const EXCEPTION_REGS_SIZE = 32;
+
     const Self = @This();
 
     fn init(self: *Self, pid: u32, pc: vaddr) void {
@@ -179,21 +183,30 @@ const Process = struct {
         var stack_u32: []u32 = undefined;
         stack_u32.ptr = @ptrCast(self.stack.ptr);
         stack_u32.len = self.stack.len / 4;
-        stack_u32[stack_u32.len - 1] = 0; // s11
-        stack_u32[stack_u32.len - 2] = 0; // s10
-        stack_u32[stack_u32.len - 3] = 0; // s9
-        stack_u32[stack_u32.len - 4] = 0; // s8
-        stack_u32[stack_u32.len - 5] = 0; // s7
-        stack_u32[stack_u32.len - 6] = 0; // s6
-        stack_u32[stack_u32.len - 7] = 0; // s5
-        stack_u32[stack_u32.len - 8] = 0; // s4
-        stack_u32[stack_u32.len - 9] = 0; // s3
-        stack_u32[stack_u32.len - 10] = 0; // s2
-        stack_u32[stack_u32.len - 11] = 0; // s1
-        stack_u32[stack_u32.len - 12] = 0; // s0
-        stack_u32[stack_u32.len - 13] = pc; // ra
+        // There are EXCEPTION_REGS_SIZE regs to save in case of an exception,
+        // so the last one of them is at EXCEPTION_REGS_SIZE - 1.
+        stack_u32[stack_u32.len - EXCEPTION_REGS_SIZE - 2] = 0; // s11
+        stack_u32[stack_u32.len - EXCEPTION_REGS_SIZE - 3] = 0; // s10
+        stack_u32[stack_u32.len - EXCEPTION_REGS_SIZE - 4] = 0; // s9
+        stack_u32[stack_u32.len - EXCEPTION_REGS_SIZE - 5] = 0; // s8
+        stack_u32[stack_u32.len - EXCEPTION_REGS_SIZE - 6] = 0; // s7
+        stack_u32[stack_u32.len - EXCEPTION_REGS_SIZE - 7] = 0; // s6
+        stack_u32[stack_u32.len - EXCEPTION_REGS_SIZE - 8] = 0; // s5
+        stack_u32[stack_u32.len - EXCEPTION_REGS_SIZE - 9] = 0; // s4
+        stack_u32[stack_u32.len - EXCEPTION_REGS_SIZE - 11] = 0; // s3
+        stack_u32[stack_u32.len - EXCEPTION_REGS_SIZE - 11] = 0; // s2
+        stack_u32[stack_u32.len - EXCEPTION_REGS_SIZE - 12] = 0; // s1
+        stack_u32[stack_u32.len - EXCEPTION_REGS_SIZE - 13] = 0; // s0
+        stack_u32[stack_u32.len - EXCEPTION_REGS_SIZE - 14] = pc; // ra
 
-        self.sp = @intFromPtr(&stack_u32[stack_u32.len - 13]);
+        self.sp = @intFromPtr(&stack_u32[stack_u32.len - EXCEPTION_REGS_SIZE - 14]);
+    }
+
+    fn exception_regs_stack_start(self: *Self) *u32 {
+        var stack_u32: []u32 = undefined;
+        stack_u32.ptr = @ptrCast(self.stack.ptr);
+        stack_u32.len = self.stack.len / 4;
+        return &stack_u32[stack_u32.len - EXCEPTION_REGS_SIZE - 1];
     }
 };
 
@@ -283,6 +296,15 @@ fn yield() void {
     }
     if (next == current_proc)
         return;
+
+    // Save pointer to the next process stack in case there
+    // is an exception
+    asm volatile (
+        \\ csrw sscratch, %[next_stack]
+        :
+        : [next_stack] "r" (next.exception_regs_stack_start()),
+    );
+
     const prev = current_proc;
     current_proc = next;
 
@@ -355,10 +377,14 @@ const trap_frame = packed struct {
     sp: u32,
 };
 
-export fn kernel_entry() align(4) callconv(.Naked) void {
+export fn kernel_exception_entry() align(4) callconv(.Naked) void {
     asm volatile (
-        \\csrw sscratch, sp
-        \\addi sp, sp, -4 * 32
+    // Get kernel stack of the process from sscratch (put there by context switch) into sp.
+    // The orignal sp from the time of the exception will be in the sscratch.
+        \\csrrw sp, sscratch, sp
+        \\addi sp, sp, -4 * 31
+        // Kernel stack of the process has EXCEPTION_REGS_SIZE * 4 bytes free specificly to
+        // save these regs in case of the exception.
         \\sw ra,  4 * 0(sp)
         \\sw gp,  4 * 1(sp)
         \\sw tp,  4 * 2(sp)
@@ -389,10 +415,20 @@ export fn kernel_entry() align(4) callconv(.Naked) void {
         \\sw s9,  4 * 27(sp)
         \\sw s10, 4 * 28(sp)
         \\sw s11, 4 * 29(sp)
+
+        // save sp at the time of exception
         \\csrr a0, sscratch
         \\sw a0, 4 * 30(sp)
+
+        // reset a0 to point back at the beginning of the stack
+        \\addi a0, sp, 4 * 31
+        \\csrw sscratch, a0
+
+        // call handle_trap with sp pointing to the beginning of the `trap_frame` struct
         \\mv a0, sp
         \\call handle_trap
+
+        // restore all regs
         \\lw ra,  4 * 0(sp)
         \\lw gp,  4 * 1(sp)
         \\lw tp,  4 * 2(sp)
