@@ -77,6 +77,7 @@ const KernelPageAllocator = struct {
         const bytes = n * PAGE_SIZE;
         if (@intFromPtr(__ram_end) < self.cursor + n)
             unreachable;
+        self.cursor += bytes;
         var slice: []align(PAGE_SIZE) u8 = undefined;
         slice.ptr = @ptrFromInt(self.cursor);
         slice.len = bytes;
