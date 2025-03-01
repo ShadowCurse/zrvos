@@ -610,13 +610,25 @@ fn write_csr(comptime name: []const u8, v: u32) void {
     );
 }
 
+const SCAUSE_ECALL = 8;
 export fn handle_trap(tf: *const trap_frame) void {
     const scause = read_csr("scause");
     const stval = read_csr("stval");
     const user_pc = read_csr("sepc");
-    log("trap: scause: 0x{x}, stval: 0x{x}, user_pc: 0x{x}", .{ scause, stval, user_pc });
-    log("trap_frame: {any}", .{tf});
-    unreachable;
+    _ = stval;
+    if (scause == SCAUSE_ECALL) {
+        handle_syscall(tf);
+        write_csr("sepc", user_pc + 4);
+    } else {
+        unreachable;
+    }
+}
+
+fn handle_syscall(tf: *const trap_frame) void {
+    switch (tf.a0) {
+        0 => sbi_put_char(@truncate(tf.a1)),
+        else => @panic("unknown syscall"),
+    }
 }
 
 const sbiret = extern struct {
