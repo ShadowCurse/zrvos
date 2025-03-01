@@ -17,6 +17,7 @@ export fn start() linksection(".text.start") callconv(.Naked) void {
 }
 
 const SYSCALL_PUTCHAR = 0;
+const SYSCALL_GETCHAR = 1;
 fn syscall3(n: u32, arg0: u32, arg1: u32, arg2: u32) u32 {
     return asm volatile (
         \\ecall
@@ -32,6 +33,11 @@ fn putchar(char: u8) void {
     _ = syscall3(SYSCALL_PUTCHAR, char, 0, 0);
 }
 
+fn getchar() u8 {
+    const r = syscall3(SYSCALL_GETCHAR, 0, 0, 0);
+    return @truncate(r);
+}
+
 const ConsoleWriter = std.io.GenericWriter(void, error{}, console_write);
 fn console_write(_: void, string: []const u8) !usize {
     for (string) |c| {
@@ -40,14 +46,51 @@ fn console_write(_: void, string: []const u8) !usize {
     return string.len;
 }
 
-fn log(
+fn print(
     comptime format: []const u8,
     args: anytype,
 ) void {
     const writer: ConsoleWriter = .{ .context = {} };
-    writer.print(format ++ "\n", args) catch unreachable;
+    writer.print(format, args) catch unreachable;
+}
+
+fn exec_cmd(cmd: []const u8) void {
+    if (std.mem.eql(u8, cmd, "hello")) {
+        print("Hello {d}\n", .{69});
+    } else {
+        print("Unknown command\n", .{});
+    }
 }
 
 export fn main() void {
-    log("Hello from userspace: {d}", .{69});
+    var cmd: [128]u8 = undefined;
+    var cmd_cursor: u32 = 0;
+    while (true) {
+        print("> {s}", .{cmd[0..cmd_cursor]});
+        while (true) {
+            const c = getchar();
+            switch (c) {
+                '\r' => {
+                    print("\n", .{});
+                    exec_cmd(cmd[0..cmd_cursor]);
+                    cmd_cursor = 0;
+                    break;
+                },
+                127 => {
+                    if (0 < cmd_cursor) {
+                        print("\n", .{});
+                        cmd_cursor -= 1;
+                        break;
+                    }
+                },
+                else => {
+                    if (cmd_cursor == cmd.len) {} else {
+                        cmd[cmd_cursor] = c;
+                        cmd_cursor += 1;
+                        putchar(c);
+                    }
+                },
+            }
+        }
+    }
 }

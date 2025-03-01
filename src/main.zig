@@ -611,7 +611,7 @@ fn write_csr(comptime name: []const u8, v: u32) void {
 }
 
 const SCAUSE_ECALL = 8;
-export fn handle_trap(tf: *const trap_frame) void {
+export fn handle_trap(tf: *trap_frame) void {
     const scause = read_csr("scause");
     const stval = read_csr("stval");
     const user_pc = read_csr("sepc");
@@ -624,15 +624,26 @@ export fn handle_trap(tf: *const trap_frame) void {
     }
 }
 
-fn handle_syscall(tf: *const trap_frame) void {
+const SYSCALL_PUTCHAR = 0;
+const SYSCALL_GETCHAR = 1;
+fn handle_syscall(tf: *trap_frame) void {
     switch (tf.a0) {
-        0 => sbi_put_char(@truncate(tf.a1)),
+        SYSCALL_PUTCHAR => sbi_put_char(@truncate(tf.a1)),
+        SYSCALL_GETCHAR => {
+            while (true) {
+                const r = sbi_get_char();
+                if (0 <= r.@"error") {
+                    tf.a0 = @bitCast(r.@"error");
+                    break;
+                }
+            }
+        },
         else => @panic("unknown syscall"),
     }
 }
 
 const sbiret = extern struct {
-    @"error": u32,
+    @"error": i32,
     value: u32,
 };
 
@@ -661,7 +672,7 @@ fn sbi_call(
     // zig does not allow multliple returns from assembly
     // read a0 and a1 manually
     const a0 = asm volatile ("mv %[ret], a0"
-        : [ret] "={a0}" (-> u32),
+        : [ret] "={a0}" (-> i32),
     );
     const a1 = asm volatile ("mv %[ret], a1"
         : [ret] "={a1}" (-> u32),
@@ -671,6 +682,10 @@ fn sbi_call(
 
 fn sbi_put_char(char: u8) void {
     _ = sbi_call(@intCast(char), 0, 0, 0, 0, 0, 0, 1);
+}
+
+fn sbi_get_char() sbiret {
+    return sbi_call(0, 0, 0, 0, 0, 0, 0, 2);
 }
 
 const ConsoleWriter = std.io.GenericWriter(void, error{}, console_write);
