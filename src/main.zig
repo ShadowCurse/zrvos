@@ -65,6 +65,7 @@ const __bss_end = @extern([*]u8, .{ .name = "__bss_end" });
 const __stack_top = @extern([*]u8, .{ .name = "__stack_top" });
 const __ram_start = @extern([*]align(PAGE_SIZE) u8, .{ .name = "__ram_start" });
 const __ram_end = @extern([*]align(PAGE_SIZE) u8, .{ .name = "__ram_end" });
+const __kernel_base = @extern([*]align(PAGE_SIZE) u8, .{ .name = "__kernel_base" });
 
 var kernel_page_allocator: KernelPageAllocator = undefined;
 const KernelPageAllocator = struct {
@@ -127,6 +128,10 @@ fn unimpl() void {
     asm volatile ("unimp");
 }
 
+fn is_aligned(addr: usize, aligment: usize) bool {
+    return (addr & (aligment - 1)) == 0;
+}
+
 fn save_regs_asm(comptime regs: []const []const u8) []const u8 {
     comptime var s: []const u8 = std.fmt.comptimePrint("addi sp, sp, -4 * {d}\n", .{regs.len});
     inline for (regs, 0..) |reg, i| {
@@ -143,6 +148,89 @@ fn restore_regs_asm(comptime regs: []const []const u8) []const u8 {
     s = s ++ std.fmt.comptimePrint("addi sp, sp, 4 * {d}\n", .{regs.len});
     return s;
 }
+
+// Page table is just an array of entries.
+const PageTable = struct {
+    const SATP_SV32 = 1 << 31;
+
+    const Flags = packed struct(u10) {
+        valid: bool = false,
+        read: bool = false,
+        write: bool = false,
+        execute: bool = false,
+        user: bool = false,
+        g: bool = false,
+        accessed: bool = false,
+        dirty: bool = false,
+        rsw: u2 = 0,
+    };
+    const Entry = packed struct(u32) {
+        flags: Flags,
+        page_number: packed struct(u22) {
+            n_0: u10,
+            n_1: u12,
+        },
+
+        fn set_page_number(self: *Entry, ptr: *anyopaque) void {
+            const u: usize = @intFromPtr(ptr);
+            const page_number: u22 = @intCast(u / PAGE_SIZE);
+            self.page_number = @bitCast(page_number);
+        }
+
+        fn ptr_from_page_number(self: *const Entry, comptime T: type) *T {
+            const page_num: usize =
+                @intCast(@as(u22, @bitCast(self.page_number)));
+            return @ptrFromInt(page_num * PAGE_SIZE);
+        }
+    };
+
+    const Address = packed struct(usize) {
+        page_offse: u12 = 0,
+        vpn_0: u10 = 0,
+        vpn_1: u10 = 0,
+    };
+
+    const Self = @This();
+
+    fn new() *Self {
+        const page = kernel_page_allocator.alloc(1);
+        @memset(page, 0);
+        return @ptrCast(page.ptr);
+    }
+
+    fn entries(self: *Self) [*]Entry {
+        return @alignCast(@ptrCast(self));
+    }
+
+    fn start_page_number(self: *const Self) usize {
+        const page_num = @as(usize, @intFromPtr(self)) / PAGE_SIZE;
+        return page_num;
+    }
+
+    fn map(self: *Self, virt: vaddr, phys: paddr, flags: Flags) void {
+        if (!is_aligned(virt, PAGE_SIZE))
+            @panic("virt page is not page aligned");
+
+        if (!is_aligned(phys, PAGE_SIZE))
+            @panic("phys page is not page aligned");
+
+        const virt_addr: Address = @bitCast(virt);
+        const vpn1 = virt_addr.vpn_1;
+        const vpn1_entry: *Entry = &self.entries()[vpn1];
+        if (!vpn1_entry.flags.valid) {
+            const page = kernel_page_allocator.alloc(1);
+            vpn1_entry.flags.valid = true;
+            vpn1_entry.set_page_number(page.ptr);
+        }
+
+        const table_0: *Self = vpn1_entry.ptr_from_page_number(Self);
+        const page_num: u22 = @intCast(phys / PAGE_SIZE);
+        const vpn0 = virt_addr.vpn_0;
+        table_0.entries()[vpn0].flags = flags;
+        table_0.entries()[vpn0].flags.valid = true;
+        table_0.entries()[vpn0].page_number = @bitCast(page_num);
+    }
+};
 
 const MAX_PROCESSES = 4;
 var processes: [MAX_PROCESSES]Process = undefined;
@@ -169,6 +257,7 @@ const Process = struct {
     state: ProcessState = .unused,
     sp: vaddr = 0,
     stack: []align(PAGE_SIZE) u8,
+    page_table: *PageTable = undefined,
 
     // During exception handling the first 32 * 4 bytes will be used
     // to store registers. Actual process stack starts from 33 * 4 byte.
@@ -200,6 +289,14 @@ const Process = struct {
         stack_u32[stack_u32.len - EXCEPTION_REGS_SIZE - 14] = pc; // ra
 
         self.sp = @intFromPtr(&stack_u32[stack_u32.len - EXCEPTION_REGS_SIZE - 14]);
+
+        var page_table = PageTable.new();
+        var phys: paddr = @intFromPtr(__kernel_base);
+        const end: paddr = @intFromPtr(__ram_end);
+        while (phys < end) : (phys += PAGE_SIZE) {
+            page_table.map(phys, phys, .{ .read = true, .write = true, .execute = true });
+        }
+        self.page_table = page_table;
     }
 
     fn exception_regs_stack_start(self: *Self) *u32 {
@@ -300,9 +397,13 @@ fn yield() void {
     // Save pointer to the next process stack in case there
     // is an exception
     asm volatile (
+        \\sfence.vma
+        \\csrw satp, %[satp]
+        \\sfence.vma
         \\ csrw sscratch, %[next_stack]
         :
-        : [next_stack] "r" (next.exception_regs_stack_start()),
+        : [satp] "r" (PageTable.SATP_SV32 | next.page_table.start_page_number()),
+          [next_stack] "r" (next.exception_regs_stack_start()),
     );
 
     const prev = current_proc;
