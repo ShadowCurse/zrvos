@@ -28,21 +28,26 @@ export fn kernel_main() void {
     a[1] = 2;
     log("Some allocated numbers: {any}", .{a});
 
-    proc_1 = create_process(@intFromPtr(&proc_1_entry));
-    proc_2 = create_process(@intFromPtr(&proc_2_entry));
-    proc_1_entry();
+    idle_proc = create_process(0);
+    idle_proc.pid = 0;
+    current_proc = idle_proc;
+    _ = create_process(@intFromPtr(&proc_1_entry));
+    _ = create_process(@intFromPtr(&proc_2_entry));
+    print_processes();
 
-    unimpl();
+    yield();
+
+    @panic("switched to idle process");
 }
 
-var proc_1: *Process = undefined;
-var proc_2: *Process = undefined;
+var current_proc: *Process = undefined;
+var idle_proc: *Process = undefined;
 
 fn proc_1_entry() void {
     log("starting proc 1", .{});
     while (true) {
         sbi_put_char('A');
-        context_switch(&proc_1.sp, &proc_2.sp);
+        yield();
         delay();
     }
 }
@@ -50,7 +55,7 @@ fn proc_2_entry() void {
     log("starting proc 2", .{});
     while (true) {
         sbi_put_char('B');
-        context_switch(&proc_2.sp, &proc_1.sp);
+        yield();
         delay();
     }
 }
@@ -139,7 +144,7 @@ fn restore_regs_asm(comptime regs: []const []const u8) []const u8 {
     return s;
 }
 
-const MAX_PROCESSES = 32;
+const MAX_PROCESSES = 4;
 var processes: [MAX_PROCESSES]Process = undefined;
 fn init_processes() void {
     for (&processes) |*proc| {
@@ -148,6 +153,11 @@ fn init_processes() void {
         proc.* = .{
             .stack = stack,
         };
+    }
+}
+fn print_processes() void {
+    for (&processes) |*proc| {
+        log("process: pid: {d} state: {any}, sp: 0x{x}", .{ proc.pid, proc.state, proc.sp });
     }
 }
 const ProcessState = enum {
@@ -195,23 +205,120 @@ fn create_process(pc: vaddr) *Process {
         }
     }
 
-    panic("No available processes", null, null);
+    @panic("No available processes");
 }
 
-// This function does generate prolog and epilog even though it does not need it.
-// This is most likely due to generating assembly string at compile time. Maybe
-// new version of compiler will fix this.
-noinline fn context_switch(noalias prev_sp: *vaddr, noalias next_sp: *vaddr) void {
-    const regs = &.{ "ra", "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11" };
-    asm volatile (save_regs_asm(regs) ++
-            "sw sp, (%[arg1])\n" ++
-            "lw sp, (%[arg2])\n" ++
-            restore_regs_asm(regs) ++
-            "ret\n"
-        :
-        : [arg1] "r" (prev_sp),
-          [arg2] "r" (next_sp),
+// Naked functions cannot have inputs. When calling this function `a0` and `a1` registers need
+// to contain pointers to the current and next stack pointers.
+export fn context_switch() callconv(.Naked) void {
+    // This function does generate prolog and epilog even though it does not need it.
+    // This is most likely due to generating assembly string at compile time. Maybe
+    // new version of compiler will fix this.
+    // const regs = &.{
+    //     "ra",
+    //     "s0",
+    //     "s1",
+    //     "s2",
+    //     "s3",
+    //     "s4",
+    //     "s5",
+    //     "s6",
+    //     "s7",
+    //     "s8",
+    //     "s9",
+    //     "s10",
+    //     "s11",
+    // };
+    // asm volatile (save_regs_asm(regs) ++
+    //         "sw sp, (a0)\n" ++
+    //         "lw sp, (a1)\n" ++
+    //         restore_regs_asm(regs) ++
+    //         "ret\n");
+    //
+    asm volatile (
+        \\addi sp, sp, -13 * 4
+        \\sw ra,  0  * 4(sp)
+        \\sw s0,  1  * 4(sp)
+        \\sw s1,  2  * 4(sp)
+        \\sw s2,  3  * 4(sp)
+        \\sw s3,  4  * 4(sp)
+        \\sw s4,  5  * 4(sp)
+        \\sw s5,  6  * 4(sp)
+        \\sw s6,  7  * 4(sp)
+        \\sw s7,  8  * 4(sp)
+        \\sw s8,  9  * 4(sp)
+        \\sw s9,  10 * 4(sp)
+        \\sw s10, 11 * 4(sp)
+        \\sw s11, 12 * 4(sp)
+        \\sw sp, (a0)
+        \\lw sp, (a1)
+        \\lw ra,  0  * 4(sp)
+        \\lw s0,  1  * 4(sp)
+        \\lw s1,  2  * 4(sp)
+        \\lw s2,  3  * 4(sp)
+        \\lw s3,  4  * 4(sp)
+        \\lw s4,  5  * 4(sp)
+        \\lw s5,  6  * 4(sp)
+        \\lw s6,  7  * 4(sp)
+        \\lw s7,  8  * 4(sp)
+        \\lw s8,  9  * 4(sp)
+        \\lw s9,  10 * 4(sp)
+        \\lw s10, 11 * 4(sp)
+        \\lw s11, 12 * 4(sp)
+        \\addi sp, sp, 13 * 4
+        \\ret
     );
+}
+
+fn yield() void {
+    var next = idle_proc;
+    for (0..processes.len) |i| {
+        const proc = &processes[(current_proc.pid + i) % processes.len];
+        if (proc.state == .runnable and
+            proc.pid != 0)
+        {
+            next = proc;
+            break;
+        }
+    }
+    if (next == current_proc)
+        return;
+    const prev = current_proc;
+    current_proc = next;
+
+    // We cannot call naked funcionts directly. Need to use assembly.
+    asm volatile (
+        \\mv a0, %[prev]
+        \\mv a1, %[next]
+        \\call context_switch
+        :
+        : [prev] "r" (&prev.sp),
+          [next] "r" (&next.sp),
+    );
+}
+
+fn print_regs() void {
+    inline for (&.{
+        "ra",
+        "s0",
+        "s1",
+        "s2",
+        "s3",
+        "s4",
+        "s5",
+        "s6",
+        "s7",
+        "s8",
+        "s9",
+        "s10",
+        "s11",
+    }) |r| {
+        const ra =
+            asm volatile ("mv %[ret], " ++ r
+            : [ret] "={a0}" (-> u32),
+        );
+        log("{s}: 0x{x}", .{ r, ra });
+    }
 }
 
 const trap_frame = packed struct {
