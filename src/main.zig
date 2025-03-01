@@ -1,6 +1,9 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+const shell: []const u8 = @embedFile("shell.bin");
+const USER_BASE = 0x1000000;
+
 const PAGE_SIZE = 4096;
 const paddr = usize;
 const vaddr = usize;
@@ -28,12 +31,14 @@ export fn kernel_main() void {
     a[1] = 2;
     log("Some allocated numbers: {any}", .{a});
 
-    idle_proc = create_process(0);
+    // idle_proc = create_process(0);
+    idle_proc = create_process(&.{});
     idle_proc.pid = 0;
     current_proc = idle_proc;
-    _ = create_process(@intFromPtr(&proc_1_entry));
-    _ = create_process(@intFromPtr(&proc_2_entry));
-    print_processes();
+    _ = create_process(shell);
+    // _ = create_process(@intFromPtr(&proc_1_entry));
+    // _ = create_process(@intFromPtr(&proc_2_entry));
+    // print_processes();
 
     yield();
 
@@ -43,22 +48,22 @@ export fn kernel_main() void {
 var current_proc: *Process = undefined;
 var idle_proc: *Process = undefined;
 
-fn proc_1_entry() void {
-    log("starting proc 1", .{});
-    while (true) {
-        sbi_put_char('A');
-        yield();
-        delay();
-    }
-}
-fn proc_2_entry() void {
-    log("starting proc 2", .{});
-    while (true) {
-        sbi_put_char('B');
-        yield();
-        delay();
-    }
-}
+// fn proc_1_entry() void {
+//     log("starting proc 1", .{});
+//     while (true) {
+//         sbi_put_char('A');
+//         yield();
+//         delay();
+//     }
+// }
+// fn proc_2_entry() void {
+//     log("starting proc 2", .{});
+//     while (true) {
+//         sbi_put_char('B');
+//         yield();
+//         delay();
+//     }
+// }
 
 const __bss = @extern([*]u8, .{ .name = "__bss" });
 const __bss_end = @extern([*]u8, .{ .name = "__bss_end" });
@@ -248,6 +253,19 @@ fn print_processes() void {
         log("process: pid: {d} state: {any}, sp: 0x{x}", .{ proc.pid, proc.state, proc.sp });
     }
 }
+
+const SSTATUS_SPIE = 1 << 5;
+fn user_entry() callconv(.Naked) void {
+    asm volatile (
+        \\csrw sepc, %[sepc]
+        \\csrw sstatus, %[sstatus]
+        \\sret
+        :
+        : [sepc] "r" (USER_BASE),
+          [sstatus] "r" (SSTATUS_SPIE),
+    );
+}
+
 const ProcessState = enum {
     unused,
     runnable,
@@ -265,7 +283,7 @@ const Process = struct {
 
     const Self = @This();
 
-    fn init(self: *Self, pid: u32, pc: vaddr) void {
+    fn init(self: *Self, pid: u32, program: []const u8) void {
         self.pid = pid;
         self.state = .runnable;
 
@@ -286,17 +304,29 @@ const Process = struct {
         stack_u32[stack_u32.len - EXCEPTION_REGS_SIZE - 11] = 0; // s2
         stack_u32[stack_u32.len - EXCEPTION_REGS_SIZE - 12] = 0; // s1
         stack_u32[stack_u32.len - EXCEPTION_REGS_SIZE - 13] = 0; // s0
-        stack_u32[stack_u32.len - EXCEPTION_REGS_SIZE - 14] = pc; // ra
+        stack_u32[stack_u32.len - EXCEPTION_REGS_SIZE - 14] = @intFromPtr(&user_entry); // ra
 
         self.sp = @intFromPtr(&stack_u32[stack_u32.len - EXCEPTION_REGS_SIZE - 14]);
 
         var page_table = PageTable.new();
+        self.page_table = page_table;
+
+        // Map kernel pages
         var phys: paddr = @intFromPtr(__kernel_base);
         const end: paddr = @intFromPtr(__ram_end);
         while (phys < end) : (phys += PAGE_SIZE) {
             page_table.map(phys, phys, .{ .read = true, .write = true, .execute = true });
         }
-        self.page_table = page_table;
+
+        // Map user pages
+        var offset: u32 = 0;
+        while (offset < program.len) : (offset += PAGE_SIZE) {
+            const page = kernel_page_allocator.alloc(1);
+            const copy_size = @min(PAGE_SIZE, program.len - offset);
+            @memcpy(page[0..copy_size], program[offset..][0..copy_size]);
+            const user_addr = USER_BASE + offset;
+            page_table.map(user_addr, @intFromPtr(page.ptr), .{ .user = true, .read = true, .write = true, .execute = true });
+        }
     }
 
     fn exception_regs_stack_start(self: *Self) *u32 {
@@ -307,10 +337,10 @@ const Process = struct {
     }
 };
 
-fn create_process(pc: vaddr) *Process {
+fn create_process(program: []const u8) *Process {
     for (&processes, 0..) |*proc, i| {
         if (proc.state == .unused) {
-            proc.init(i + 1, pc);
+            proc.init(i + 1, program);
             return proc;
         }
     }
