@@ -3,6 +3,7 @@ const std = @import("std");
 const __stack_top = @extern([*]u8, .{ .name = "__stack_top" });
 
 export fn exit() noreturn {
+    _ = syscall3(SYSCALL_EXIT, 0, 0, 0);
     while (true) {}
 }
 
@@ -18,6 +19,7 @@ export fn start() linksection(".text.start") callconv(.Naked) void {
 
 const SYSCALL_PUTCHAR = 0;
 const SYSCALL_GETCHAR = 1;
+const SYSCALL_EXIT = 2;
 fn syscall3(n: u32, arg0: u32, arg1: u32, arg2: u32) u32 {
     return asm volatile (
         \\ecall
@@ -54,12 +56,15 @@ fn print(
     writer.print(format, args) catch unreachable;
 }
 
-fn exec_cmd(cmd: []const u8) void {
+fn exec_cmd(cmd: []const u8) bool {
     if (std.mem.eql(u8, cmd, "hello")) {
         print("Hello {d}\n", .{69});
+    } else if (std.mem.eql(u8, cmd, "exit")) {
+        return true;
     } else {
         print("Unknown command\n", .{});
     }
+    return false;
 }
 
 export fn main() void {
@@ -72,7 +77,8 @@ export fn main() void {
             switch (c) {
                 '\r' => {
                     print("\n", .{});
-                    exec_cmd(cmd[0..cmd_cursor]);
+                    if (exec_cmd(cmd[0..cmd_cursor]))
+                        return;
                     cmd_cursor = 0;
                     break;
                 },

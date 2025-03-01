@@ -269,6 +269,7 @@ fn user_entry() callconv(.Naked) void {
 const ProcessState = enum {
     unused,
     runnable,
+    exited,
 };
 const Process = struct {
     pid: u32 = 0,
@@ -626,6 +627,7 @@ export fn handle_trap(tf: *trap_frame) void {
 
 const SYSCALL_PUTCHAR = 0;
 const SYSCALL_GETCHAR = 1;
+const SYSCALL_EXIT = 2;
 fn handle_syscall(tf: *trap_frame) void {
     switch (tf.a0) {
         SYSCALL_PUTCHAR => sbi_put_char(@truncate(tf.a1)),
@@ -637,6 +639,12 @@ fn handle_syscall(tf: *trap_frame) void {
                     break;
                 }
             }
+        },
+        SYSCALL_EXIT => {
+            log("process: {d} exited", .{current_proc.pid});
+            current_proc.state = .exited;
+            yield();
+            unreachable;
         },
         else => @panic("unknown syscall"),
     }
