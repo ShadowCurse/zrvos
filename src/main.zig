@@ -3,6 +3,7 @@ const Allocator = std.mem.Allocator;
 
 const shell: []const u8 = @embedFile("shell.bin");
 const USER_BASE = 0x1000000;
+const VIRTIO_BLK_PADDR = 0x10001000;
 
 const PAGE_SIZE = 4096;
 const paddr = usize;
@@ -25,6 +26,12 @@ export fn kernel_main() void {
     write_csr("stvec", @intFromPtr(&kernel_exception_entry));
 
     log("Hello: {d}", .{69});
+
+    virtio_blk.init(VIRTIO_BLK_PADDR);
+
+    var buff: [512]u8 = undefined;
+    virtio_blk.send_request(&buff, 0, false);
+    log("Read from block: {s}", .{buff});
 
     var a = kernel_bump_allocator.alloc(u8, 2) catch unreachable;
     a[0] = 1;
@@ -328,6 +335,8 @@ const Process = struct {
             const user_addr = USER_BASE + offset;
             page_table.map(user_addr, @intFromPtr(page.ptr), .{ .user = true, .read = true, .write = true, .execute = true });
         }
+
+        page_table.map(VIRTIO_BLK_PADDR, VIRTIO_BLK_PADDR, .{ .read = true, .write = true });
     }
 
     fn exception_regs_stack_start(self: *Self) *u32 {
@@ -721,3 +730,188 @@ pub fn panic(message: []const u8, stack_trace: ?*std.builtin.StackTrace, ra: ?us
     wfi();
     while (true) {}
 }
+
+const VIRTIO_BLK_DEV = 2;
+const VIRTIO_BLK_SECTOR_SIZE = 512;
+const VIRTIO_BLK_QUEUE_SIZE = 16;
+const VIRTQ_DESC_F_NEXT = 1;
+const VIRTQ_DESC_F_WRITE = 2;
+const VIRTQ_AVAIL_F_NO_INTERRUPT = 1;
+const VIRTIO_BLK_T_IN = 0;
+const VIRTIO_BLK_T_OUT = 1;
+
+const VIRTIO_REG_MAGIC = 0x00;
+const VIRTIO_REG_VERSION = 0x04;
+const VIRTIO_REG_DEVICE_ID = 0x08;
+const VIRTIO_REG_DEVICE_FEATURES = 0x010;
+const VIRTIO_REG_DEVICE_FEATURES_SEL = 0x014;
+const VIRTIO_REG_DRIVER_FEATURES = 0x020;
+const VIRTIO_REG_DRIVER_FEATURES_SEL = 0x024;
+const VIRTIO_REG_QUEUE_SEL = 0x30;
+const VIRTIO_REG_QUEUE_NUM_MAX = 0x34;
+const VIRTIO_REG_QUEUE_SIZE = 0x38;
+const VIRTIO_REG_QUEUE_READY = 0x44;
+const VIRTIO_REG_QUEUE_NOTIFY = 0x50;
+const VIRTIO_REG_QUEUE_INT_STATUS = 0x60;
+const VIRTIO_REG_DEVICE_STATUS = 0x70;
+const VIRTIO_REG_QUEUE_DESC_LOW = 0x80;
+const VIRTIO_REG_QUEUE_DESC_HI = 0x84;
+const VIRTIO_REG_QUEUE_AVAIL_LOW = 0x90;
+const VIRTIO_REG_QUEUE_AVAIL_HI = 0x94;
+const VIRTIO_REG_QUEUE_USED_LOW = 0xa0;
+const VIRTIO_REG_QUEUE_USED_HI = 0xa4;
+const VIRTIO_REG_DEVICE_CONFIG = 0x100;
+
+const VIRTIO_INIT: u32 = 0;
+const VIRTIO_ACKNOWLEDGE: u32 = 1;
+const VIRTIO_DRIVER: u32 = 2;
+const VIRTIO_FAILED: u32 = 128;
+const VIRTIO_FEATURES_OK: u32 = 8;
+const VIRTIO_DRIVER_OK: u32 = 4;
+
+const VRING_DESC_F_NEXT = 1;
+const VringDesc = extern struct {
+    addr: u64 align(16) = 0,
+    len: u32 = 0,
+    flags: u16 = 0,
+    next: u16 = 0,
+};
+const VringAvail = extern struct {
+    flags: u16 align(2) = 0,
+    idx: u16 = 0,
+    ring: [VIRTIO_BLK_QUEUE_SIZE]u16 = undefined,
+};
+const VringUsedElem = extern struct {
+    id: u32 = 0,
+    len: u32 = 0,
+};
+const VringUsed = extern struct {
+    flags: u16 align(4) = 0,
+    idx: u16 = 0,
+    ring: [VIRTIO_BLK_QUEUE_SIZE]VringUsedElem = undefined,
+};
+const VirtioQueue = extern struct {
+    descriptors: [VIRTIO_BLK_QUEUE_SIZE]VringDesc = undefined,
+    used_ring: VringUsed = .{},
+    avail_ring: VringAvail = .{},
+    last_used: u16 = 0,
+};
+
+const VirtioBlkHeader = extern struct {
+    type: u32 = 0,
+    _: u32 = 0,
+    sector: u64 = 0,
+    status: u8 = 0,
+};
+
+var virtio_blk: VirtioBlock = .{};
+const VirtioBlock = struct {
+    addr: paddr = 0,
+    capacity: u64 = 0,
+    header: VirtioBlkHeader = .{},
+    queue: VirtioQueue = .{},
+
+    const Self = @This();
+
+    inline fn mem_read(self: *Self, comptime T: type, offset: u32) T {
+        const ptr: *volatile T = @ptrFromInt(self.addr + offset);
+        return ptr.*;
+    }
+
+    inline fn mem_write(self: *Self, comptime T: type, offset: u32, v: T) void {
+        const ptr: *volatile T = @ptrFromInt(self.addr + offset);
+        ptr.* = v;
+    }
+
+    inline fn set_status(self: *Self, s: u32) void {
+        const status = self.mem_read(u32, VIRTIO_REG_DEVICE_STATUS);
+        self.mem_write(u32, VIRTIO_REG_DEVICE_STATUS, status | s);
+    }
+
+    fn init(self: *Self, addr: paddr) void {
+        self.addr = addr;
+        if (self.mem_read(u32, VIRTIO_REG_MAGIC) != 0x74726976)
+            @panic("Wrong virtio block magic");
+        if (self.mem_read(u32, VIRTIO_REG_VERSION) != 2)
+            @panic("Wrong virtio block version");
+        if (self.mem_read(u32, VIRTIO_REG_DEVICE_ID) != VIRTIO_BLK_DEV)
+            @panic("Wrong virtio block device id");
+
+        self.mem_write(u32, VIRTIO_REG_DEVICE_STATUS, 0);
+        self.set_status(VIRTIO_ACKNOWLEDGE);
+        self.set_status(VIRTIO_DRIVER);
+
+        self.mem_write(u32, VIRTIO_REG_DRIVER_FEATURES_SEL, 0);
+        self.mem_write(u32, VIRTIO_REG_DRIVER_FEATURES, 0);
+        self.mem_write(u32, VIRTIO_REG_DRIVER_FEATURES_SEL, 1);
+        self.mem_write(u32, VIRTIO_REG_DRIVER_FEATURES, 1);
+
+        self.set_status(VIRTIO_FEATURES_OK);
+
+        self.mem_write(u32, VIRTIO_REG_QUEUE_SEL, 0);
+        self.mem_write(u32, VIRTIO_REG_QUEUE_SIZE, VIRTIO_BLK_QUEUE_SIZE);
+        self.mem_write(u32, VIRTIO_REG_QUEUE_DESC_LOW, @intFromPtr(&self.queue.descriptors));
+        self.mem_write(u32, VIRTIO_REG_QUEUE_DESC_HI, 0);
+        self.mem_write(u32, VIRTIO_REG_QUEUE_AVAIL_LOW, @intFromPtr(&self.queue.avail_ring));
+        self.mem_write(u32, VIRTIO_REG_QUEUE_AVAIL_HI, 0);
+        self.mem_write(u32, VIRTIO_REG_QUEUE_USED_LOW, @intFromPtr(&self.queue.used_ring));
+        self.mem_write(u32, VIRTIO_REG_QUEUE_USED_HI, 0);
+        self.mem_write(u32, VIRTIO_REG_QUEUE_READY, 1);
+
+        self.set_status(VIRTIO_DRIVER_OK);
+
+        self.capacity = self.mem_read(u64, VIRTIO_REG_DEVICE_CONFIG) * VIRTIO_BLK_SECTOR_SIZE;
+        const status = self.mem_read(u32, VIRTIO_REG_DEVICE_STATUS);
+        log("Init virtio-blk with status: 0b{b}, capacity: {d}", .{ status, self.capacity });
+    }
+
+    fn notify_device(self: *Self, desc_index: u16) void {
+        const avail_index = self.queue.avail_ring.idx;
+        self.queue.avail_ring.ring[avail_index] = desc_index;
+        self.queue.avail_ring.idx = (self.queue.avail_ring.idx + 1) % VIRTIO_BLK_QUEUE_SIZE;
+        @fence(.release);
+        self.mem_write(u32, VIRTIO_REG_QUEUE_NOTIFY, 0);
+        self.queue.last_used = (self.queue.last_used + 1) % VIRTIO_BLK_QUEUE_SIZE;
+    }
+
+    fn finished(self: *Self) bool {
+        @fence(.acquire);
+        const idx: *volatile u16 = @ptrCast(&self.queue.used_ring.idx);
+        return self.queue.last_used == idx.*;
+    }
+
+    fn send_request(self: *Self, buff: []u8, sector: u32, write: bool) void {
+        if (self.capacity / VIRTIO_BLK_SECTOR_SIZE <= sector) {
+            log("Attempt to read sector: {d} out of {d}", .{ sector, self.capacity / VIRTIO_BLK_SECTOR_SIZE });
+            return;
+        }
+
+        self.header.sector = sector;
+        self.header.type = if (write) VIRTIO_BLK_T_OUT else VIRTIO_BLK_T_IN;
+
+        const head_desc: *volatile VringDesc = &self.queue.descriptors[0];
+        head_desc.addr = @intFromPtr(&self.header);
+        head_desc.len = @sizeOf(VirtioBlkHeader);
+        head_desc.flags = VIRTQ_DESC_F_NEXT;
+        head_desc.next = 1;
+
+        const data_desc: *volatile VringDesc = &self.queue.descriptors[1];
+        data_desc.addr = @intFromPtr(buff.ptr);
+        data_desc.len = buff.len;
+        data_desc.flags = VIRTQ_DESC_F_NEXT;
+        if (!write) data_desc.flags |= VIRTQ_DESC_F_WRITE;
+        data_desc.next = 2;
+
+        const status_desc: *volatile VringDesc = &self.queue.descriptors[2];
+        status_desc.addr = @intFromPtr(&self.header.status);
+        status_desc.len = @sizeOf(u8);
+        status_desc.flags = VIRTQ_DESC_F_WRITE;
+
+        self.notify_device(0);
+
+        while (!self.finished()) {}
+
+        if (self.header.status != 0)
+            log("Error while sending a block request. Got status: {d}", .{self.header.status});
+    }
+};
