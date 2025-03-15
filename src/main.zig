@@ -478,8 +478,8 @@ fn print_regs() void {
     }) |r| {
         const ra =
             asm volatile ("mv %[ret], " ++ r
-            : [ret] "={a0}" (-> u32),
-        );
+                : [ret] "={a0}" (-> u32),
+            );
         log("{s}: 0x{x}", .{ r, ra });
     }
 }
@@ -867,17 +867,15 @@ const VirtioBlock = struct {
 
     fn notify_device(self: *Self, desc_index: u16) void {
         const avail_index = self.queue.avail_ring.idx;
-        self.queue.avail_ring.ring[avail_index] = desc_index;
-        self.queue.avail_ring.idx = (self.queue.avail_ring.idx + 1) % VIRTIO_BLK_QUEUE_SIZE;
-        @fence(.release);
+        @atomicStore(u16, &self.queue.avail_ring.ring[avail_index], desc_index, .release);
+        @atomicStore(u16, &self.queue.avail_ring.idx, (self.queue.avail_ring.idx + 1) % VIRTIO_BLK_QUEUE_SIZE, .release);
         self.mem_write(u32, VIRTIO_REG_QUEUE_NOTIFY, 0);
         self.queue.last_used = (self.queue.last_used + 1) % VIRTIO_BLK_QUEUE_SIZE;
     }
 
     fn finished(self: *Self) bool {
-        @fence(.acquire);
-        const idx: *volatile u16 = @ptrCast(&self.queue.used_ring.idx);
-        return self.queue.last_used == idx.*;
+        const idx = @atomicLoad(u16, &self.queue.used_ring.idx, .acquire);
+        return self.queue.last_used == idx;
     }
 
     fn send_request(self: *Self, buff: []u8, sector: u32, write: bool) void {
